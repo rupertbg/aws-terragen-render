@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion:          '2010-09-09'
+Description:                       'EC2 Instance that renders Terragen'
+
+Parameters:
+
+  InstanceType:
+    Description:                   EC2 instance type
+    Type:                          String
+    Default:                       m4.16xlarge
+    AllowedValues:
+      - m4.16xlarge
+      - m4.10xlarge
+      - m4.4xlarge
+    ConstraintDescription:         Please choose a valid instance type.
+
+  AMI:
+    Type:                          String
+    Description:                   A Windows 2016 AMI
+    Default:                       ami-de5eabbc
+
+  KeyPair:
+    Type:                          AWS::EC2::KeyPair::KeyName
+    Description:                   A KeyPair to use if you want to login to the instance
+
+  S3BucketName:
+    Type:                          String
+    Description:                   The bucket name where the project and license file are
+    Default:                       terragen
+
+Conditions:
+    HasKeyName:
+      Fn::Not:
+        - Fn::Equals:
+          - ""
+          - !Ref KeyPair
+
+Resources:
+
+  EC2InstanceRole:
+    Type:                          AWS::IAM::Role
+    Properties:
+      RoleName:                    !Sub ${AWS::StackName}-ec2
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect:                  Allow
+          Principal:
+            Service:
+              - ec2.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Path:                        /
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-ec2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            - Effect: Allow
+              Action:
+                - cloudformation:DeleteStack
+              Resource:
+                - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/aws:cloudformation:stack-id: !Ref AWS::StackId
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - iam:RemoveRoleFromInstanceProfile
+                - iam:DeleteInstanceProfile
+              Resource:
+                - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/*
+            - Effect: Allow
+              Action:
+                - iam:DeleteRole
+                - iam:DeleteRolePolicy
+              Resource:
+                - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-ec2
+        - PolicyName: !Sub ${AWS::StackName}-s3
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+                  - !Sub arn:aws:s3:::${S3BucketName}
+
+  EC2InstanceProfile:
+    Type:                          AWS::IAM::InstanceProfile
+    Properties:
+      Path:                        /
+      Roles:
+        - !Ref EC2InstanceRole
+
+  EC2Instance:
+    Type:                          AWS::EC2::Instance
+    Properties:
+      ImageId:                     !Ref AMI
+      KeyName:
+        Fn::If:
+          - HasKeyName
+          - !Ref KeyPair
+          - !Ref AWS::NoValue
+      InstanceType:                !Ref InstanceType
+      IamInstanceProfile:          !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64:
+          !Sub |
+            <powershell>
+
+                # Cancel running Transcripts
+                $ErrorActionPreference="SilentlyContinue"
+                Stop-Transcript | out-null
+                $ErrorActionPreference = "Continue"
+
+                # Variables
+                $TerragenFolder = "C:\terragen"
+                $RenderDate = "$((get-date).tostring("yyyy-MM-dd-HH-mm-ss"))"
+                $RenderFolder = "$TerragenFolder\renders\$RenderDate"
+                $LogFolder = "$TerragenFolder\logs"
+                $LogFilename = "$RenderDate-render-log.txt"
+                $Log = "$LogFolder\$LogFilename"
+
+                # Make directories
+                mkdir -force $RenderFolder
+                mkdir -force $LogFolder
+
+                # Start logging to Transcript
+                Start-Transcript -path $Log -append
+
+                Write-Host "Terragen Folder: $TerragenFolder"
+                Write-Host "Render Folder: $RenderFolder"
+                Write-Host "Log file: $LogFilename"
+
+                # Download and install Terragen
+                Invoke-WebRequest -Uri 'http://planetside.co.uk/downloads/tg4/v41180/fsdh37/Terragen_4_Win64_41180.msi' -OutFile 'c:\terragen.msi'
+                Start-Process msiexec.exe -ArgumentList '/i C:\terragen.msi /qn' -wait -nonewwindow
+
+                # Download and install AWS CLI
+                Invoke-WebRequest -Uri 'https://s3.amazonaws.com/aws-cli/AWSCLI64.msi' -OutFile 'c:\AWSCLI64.msi'
+                Start-Process msiexec.exe -ArgumentList '/i C:\AWSCLI64.msi /qn' -wait -nonewwindow
+
+                # Reload PATH
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+                # Download and install Terragen license file
+                aws s3 cp s3://${S3BucketName}/tg4key.lic 'C:\Program Files\Planetside Software\Terragen 4\tg4key.lic'
+
+                # Start uploading Transcript to S3
+                function UploadLog {
+                  aws s3 cp $Log "s3://${S3BucketName}/logs/$LogFilename" --quiet
+                }
+                UploadLog
+
+                # Download Terragen project
+                aws s3 cp s3://${S3BucketName}/project/ C:\terragen\project\. --recursive
+                UploadLog
+
+                # Run Terragen render
+                Write-Host "Starting new render with render date: $RenderDate"
+                cd "C:\Program Files\Planetside Software\Terragen 4\"
+                .\tgdcli.exe -p "$TerragenFolder\project\project.tgd" -hide -exit -r -f 1 -o "$RenderFolder\output-%04d-IMAGETYPE.exr"
+                UploadLog
+
+                # Upload render output to S3
+                aws s3 cp "$RenderFolder" "s3://${S3BucketName}/renders/$RenderDate" --recursive
+                UploadLog
+
+                # Stop logging to Transcript
+                Stop-Transcript
+                UploadLog
+
+                # Delete stack
+                aws --region ap-southeast-2 cloudformation delete-stack --stack-name ${AWS::StackName}
+
+            </powershell>
+            <persist>true</persist>
