@@ -18,22 +18,10 @@ Parameters:
     Description:                   A Windows 2016 AMI
     Default:                       ami-de5eabbc
 
-  KeyPair:
-    Type:                          AWS::EC2::KeyPair::KeyName
-    Description:                   A KeyPair to use if you want to login to the instance
-    Default:                       ""
-
   S3BucketName:
     Type:                          String
     Description:                   The bucket name where the project and license file are
     Default:                       terragen
-
-Conditions:
-    HasKeyName:
-      Fn::Not:
-        - Fn::Equals:
-          - ""
-          - !Ref KeyPair
 
 Resources:
 
@@ -104,11 +92,6 @@ Resources:
     Type:                          AWS::EC2::Instance
     Properties:
       ImageId:                     !Ref AMI
-      KeyName:
-        Fn::If:
-          - HasKeyName
-          - !Ref KeyPair
-          - !Ref AWS::NoValue
       InstanceType:                !Ref InstanceType
       IamInstanceProfile:          !Ref EC2InstanceProfile
       UserData:
