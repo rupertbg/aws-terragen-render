@@ -21,6 +21,7 @@ Parameters:
   KeyPair:
     Type:                          AWS::EC2::KeyPair::KeyName
     Description:                   A KeyPair to use if you want to login to the instance
+    Default:                       ""
 
   S3BucketName:
     Type:                          String
